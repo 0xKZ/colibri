@@ -1,6 +1,5 @@
-# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux and Windows/MSYS2 only.
-# Uses GNU ld -Wl,--wrap and gcc -march; do not invoke from macOS/PowerPC
-# `make check` (the parent Makefile gates COLI_V4_SUPPORTED).
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux, Windows/MSYS2, and macOS.
+# Linux uses GNU ld/gcc; macOS uses clang + libomp (Homebrew); Windows uses MinGW gcc.
 
 ifeq ($(OS),Windows_NT)
 IS_WIN := 1
@@ -19,16 +18,20 @@ else ifeq ($(UNAME_S),Linux)
 ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
 COLI_V4_OK := 1
 endif
+else ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
 endif
 
 ifneq ($(COLI_V4_OK),1)
-$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux and Windows/MSYS2)
+$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux, Windows/MSYS2, and macOS)
 endif
 
-ifneq ($(IS_WIN),)
+ifeq ($(IS_WIN),1)
+# --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
 CC = gcc
-ARCH ?= x86-64-v3
-CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
+CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(or $(ARCH),x86-64-v3) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
@@ -36,10 +39,41 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
+else ifeq ($(UNAME_S),Darwin)
+# --- macOS / Apple Silicon (and Intel Macs) ---
+CC = clang
+
+# Apple clang does not ship OpenMP. Use Homebrew libomp if available,
+# otherwise build single-threaded (OpenMP pragmas are silently ignored).
+OMPDIR := $(shell brew --prefix libomp 2>/dev/null)
+ifneq ($(and $(OMPDIR),$(wildcard $(OMPDIR)/include/omp.h),$(wildcard $(OMPDIR)/lib/libomp.*)),)
+OMPC = -Xclang -fopenmp -I$(OMPDIR)/include
+OMPL = -L$(OMPDIR)/lib -lomp
 else
+$(warning libomp not found: building single-threaded. For multithreading: brew install libomp)
+OMPC =
+OMPL =
+endif
+
+# arm64 clang uses -mcpu, not -march. Intel Macs use -march.
+# $(or) in recursive (=) vars evaluates at expansion time, properly handling
+# empty ARCH from command line (command-line vars override := assignments).
+ifeq ($(filter arm64 aarch64,$(UNAME_M)),)
+ARCHFLAG = -march=$(or $(ARCH),x86-64-v3)
+else
+ARCHFLAG = -mcpu=$(or $(ARCH),native)
+endif
+
+CFLAGS = -O3 $(ARCHFLAG) $(OMPC) -include pthread.h -Wall -Wextra -Wno-unused-parameter \
+	-Wno-misleading-indentation -Wno-unused-function \
+	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+LDFLAGS = -lm $(OMPL) -pthread
+V4_BINARY := deepseek_v4
+else
+# --- Linux x86-64 / aarch64 ---
 CC = gcc
-ARCH ?= native
-CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
+CFLAGS = -D_GNU_SOURCE -O3 -march=$(or $(ARCH),native) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \

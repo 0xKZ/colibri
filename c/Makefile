@@ -340,16 +340,17 @@ CUDA_OBJ  =
 
 # DeepSeek V4 is a separate x86-64/aarch64 runtime. Portable infrastructure
 # tests run everywhere; the engine and token-exact fixture run on x86-64
-# Linux/Windows and aarch64 Linux. SIMD fast paths are gated per-feature
-# inside the sources, so a plain armv8-a build stays correct.
+# Linux/Windows, aarch64 Linux, and macOS (Apple Silicon / Intel).
+# SIMD fast paths are gated per-feature inside the sources, so a plain
+# build stays correct. macOS uses clang + libomp (Homebrew) for OpenMP.
 COLI_V4_SUPPORTED :=
 ifneq (,$(X86_64))
-ifneq (,$(IS_WIN)$(LINUX))
+ifneq (,$(IS_WIN)$(LINUX)$(DARWIN))
 COLI_V4_SUPPORTED := 1
 endif
 endif
 ifneq (,$(AARCH64))
-ifneq (,$(LINUX))
+ifneq (,$(LINUX)$(DARWIN))
 COLI_V4_SUPPORTED := 1
 endif
 endif
@@ -490,7 +491,7 @@ all: colibri$(EXE)
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
 deepseek-v4:
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+	$(MAKE) -f Makefile.deepseek-v4 $(if $(strip $(ARCH)),ARCH=$(ARCH)) deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
@@ -887,7 +888,7 @@ V4_TEST_LINK_OBJS = \
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+	$(MAKE) -f Makefile.deepseek-v4 $(if $(strip $(ARCH)),ARCH=$(ARCH)) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
