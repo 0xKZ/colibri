@@ -3,6 +3,9 @@
 #endif
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #ifdef COLI_V4_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
@@ -674,7 +677,21 @@ uint64_t coli_v4_os_available_memory(void) {
     memset(&status, 0, sizeof(status));
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
+#elif defined(__APPLE__)
+    /* macOS: vm_statistics64 gives free + inactive pages (approx MemAvailable). */
+    vm_size_t page_size;
+    host_page_size(mach_host_self(), &page_size);
+    vm_statistics64_data_t vmstat;
+    mach_msg_type_number_t count = sizeof(vmstat) / sizeof(integer_t);
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vmstat, &count) != KERN_SUCCESS)
+        return 0;
+    /* free_count: completely unused. inactive_count: clean, reclaimable without I/O.
+     * Together these approximate Linux MemAvailable (what can be used without swap). */
+    uint64_t avail_pages = (uint64_t)vmstat.free_count + (uint64_t)vmstat.inactive_count;
+    return avail_pages * (uint64_t)page_size;
 #else
+    /* Linux: /proc/meminfo MemAvailable is the gold standard. */
     FILE *stream = fopen("/proc/meminfo", "r");
     if (stream) {
         char line[256];
@@ -684,6 +701,7 @@ uint64_t coli_v4_os_available_memory(void) {
         fclose(stream);
         if (kib) return (uint64_t)kib * 1024;
     }
+    /* Fallback: total physical memory (conservative — includes cached/buffered). */
     long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) return 0;
     return (uint64_t)pages * (uint64_t)page_size;
