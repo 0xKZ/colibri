@@ -7210,6 +7210,8 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         for (int item = 0; item < batch; item++)
             v4_mainh_tap(config, layer_id, state + (size_t)item * hd,
                          (int64_t)start + item);
+        if ((layer_id + 1) % 10 == 0 || layer_id == 0 || layer_id == config->num_hidden_layers - 1)
+            fprintf(stderr, "[V4] prefill layer %d/%d\n", layer_id + 1, config->num_hidden_layers);
     }
     *state_ptr = state;
     *next_ptr = next;
@@ -7799,6 +7801,8 @@ int coli_v4_session_generate(ColiV4Session *session,
                 reuse, prompt_count);
 
     int fresh = prompt_count - reuse;
+    fprintf(stderr, "[V4] loading %d embeddings (reuse=%d, fresh=%d)...\n", fresh, reuse, fresh);
+    fflush(stderr);
     for (int item = 0; item < fresh; item++)
         if (load_embedding(state + (size_t)item * hd, index, config,
                            session->prompt_ids[reuse + item])) {
@@ -7808,7 +7812,8 @@ int coli_v4_session_generate(ColiV4Session *session,
                 snprintf(error, error_size, "cannot load embedding");
             return -1;
         }
-
+    fprintf(stderr, "[V4] embeddings loaded, starting target_batch (prefill)...\n");
+    fflush(stderr);
     double setup_done = spec_now();
     if (target_batch(engine, &state, &next, attention, index, config, experts,
                      session->prompt_ids + reuse, reuse, fresh,
@@ -7816,6 +7821,8 @@ int coli_v4_session_generate(ColiV4Session *session,
         kv_prefix_taint(&session->fed);
         return -1;
     }
+    fprintf(stderr, "[V4] target_batch complete (prefill done)\n");
+    fflush(stderr);
     session->state = state;
     session->next = next;
     /* The batch holds only the fresh tail, so the final row is at fresh-1
@@ -8317,6 +8324,9 @@ static int v4_serve_read_request(V4ServeRequest *request,
     int fields = sscanf(line, "%*s %*s %d %d %d %f %f %d",
                         &slot, &prompt_bytes, &max_tokens,
                         &temperature, &top_p, &extension_bytes);
+    fprintf(stderr, "[V4] SUBMIT parsed: id=%s slot=%d bytes=%d max_tok=%d temp=%.1f topp=%.1f ext=%d fields=%d\n",
+            id, slot, prompt_bytes, max_tokens, temperature, top_p, extension_bytes, fields);
+    fflush(stderr);
     if (fields < 5 || slot != 0 || prompt_bytes < 0 ||
         prompt_bytes > (1 << 24) || max_tokens < 1 ||
         extension_bytes < 0 || extension_bytes > (1 << 24)) {
@@ -8331,10 +8341,14 @@ static int v4_serve_read_request(V4ServeRequest *request,
         fflush(stdout);
         return 0;
     }
+    fprintf(stderr, "[V4] reading %zu bytes from stdin...\n", total);
+    fflush(stderr);
     if (fread(payload, 1, total, stdin) != total) {
         free(payload);
         return -1;
     }
+    fprintf(stderr, "[V4] payload read complete\n");
+    fflush(stderr);
     (void)fgetc(stdin);
     payload[prompt_bytes] = 0;
     memset(request, 0, sizeof(*request));
@@ -8407,9 +8421,14 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         fprintf(stderr, "[V4] top_p %.3g ignored; target engine is greedy\n",
                 request->top_p);
 
+    fprintf(stderr, "[V4] tokenizing prompt (%d bytes)...\n", request->prompt_bytes);
+    fflush(stderr);
     int prompt_count = tok_encode(&session->tokenizer, request->prompt,
                                   request->prompt_bytes, session->prompt_ids,
                                   session->max_prompt_tokens + 16);
+    fprintf(stderr, "[V4] tokenized: %d tokens (max_prompt=%d, context=%d)\n",
+            prompt_count, session->max_prompt_tokens, engine->runtime.context_tokens);
+    fflush(stderr);
     int context = engine->runtime.context_tokens;
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens ||
         prompt_count + request->max_tokens > context) {
@@ -8420,8 +8439,12 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         v4_serve_error(request->id, message);
         return;
     }
+    fprintf(stderr, "[V4] sending ACCEPT\n");
+    fflush(stderr);
     printf("ACCEPT %s %d\n", request->id, prompt_count);
     fflush(stdout);
+    fprintf(stderr, "[V4] ACCEPT flushed, calling coli_v4_session_generate...\n");
+    fflush(stderr);
 
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
@@ -8438,6 +8461,9 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .no_dspark = 0,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
+    fprintf(stderr, "[V4] coli_v4_session_generate returned: result=%d, generated=%d, error='%s'\n",
+            result, stats.generated_tokens, error);
+    fflush(stderr);
     double elapsed = spec_now() - started;
     if (result) {
         v4_serve_error(request->id, error);

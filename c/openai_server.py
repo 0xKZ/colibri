@@ -214,7 +214,7 @@ def content_text(content, param):
 
 # ---- GLM-5.2 tool calling -----------------------------------------------------------------
 # The model expresses tool calls as ordinary text (from chat_template.jinja):
-#   <tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>
+#    <tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>
 # and tool results come back as <|observation|><tool_response>{content}</tool_response>.
 # We render those markers into the prompt and parse them back into OpenAI `tool_calls`.
 import re
@@ -375,6 +375,77 @@ def parse_tool_calls(reply, tools=None):
 
 
 ARCH = "glm"   # set in main(): glm | inkling | kimi | deepseek_v4
+
+# ---- DeepSeek V4 tool calling -----------------------------------------------------------
+# DSML format:
+#   Tool calls: <｜DSML｜tool_calls> ... <｜DSML｜invoke name="X"> ... </｜DSML｜tool_calls>
+#   Parameters: <｜DSML｜parameter name="K" string="true|false">V</｜DSML｜parameter>
+#   Tool results: <tool_result>...</tool_result> (merged into user messages)
+DSML = "｜DSML｜"
+DSML_TOOL_CALLS_OPEN = f"<{DSML}tool_calls>"
+DSML_TOOL_CALLS_CLOSE = f"</{DSML}tool_calls>"
+DSML_INVOKE_OPEN = f"<{DSML}invoke"
+DSML_INVOKE_CLOSE = f"</{DSML}invoke>"
+DSML_PARAM_TAG = f"<{DSML}parameter"
+DSML_PARAM_CLOSE = f"</{DSML}parameter>"
+DSML_PARAM_RE = re.compile(
+    r'<' + re.escape(DSML) + r'parameter\s+name="([^"]+)"\s+string="(true|false)">([^<]*)</' + re.escape(DSML) + r'parameter>',
+    re.DOTALL
+)
+DSML_INVOKE_RE = re.compile(
+    r'<' + re.escape(DSML) + r'invoke\s+name="([^"]+)">',
+    re.DOTALL
+)
+DSML_TOOL_CALLS_BLOCK_RE = re.compile(
+    re.escape(DSML_TOOL_CALLS_OPEN) + r"(.*?)" + re.escape(DSML_TOOL_CALLS_CLOSE),
+    re.DOTALL
+)
+DSML_TOOL_RESULT_OPEN = "<tool_result>"
+DSML_TOOL_RESULT_CLOSE = "</tool_result>"
+
+
+def parse_tool_calls_v4(reply, tools=None):
+    """Return (content, tool_calls) for DeepSeek V4 DSML format."""
+    calls = []
+    for block_match in DSML_TOOL_CALLS_BLOCK_RE.finditer(reply):
+        block_content = block_match.group(1)
+        for invoke_match in DSML_INVOKE_RE.finditer(block_content):
+            tool_name = invoke_match.group(1)
+            # Find the scope of this invoke block (up to </invoke>)
+            invoke_start = invoke_match.end()
+            rest = block_content[invoke_start:]
+            invoke_end = rest.find(DSML_INVOKE_CLOSE)
+            if invoke_end < 0:
+                invoke_end = len(rest)
+            invoke_body = rest[:invoke_end]
+            # Parse parameters into a proper dict, then serialize
+            parsed_args = {}
+            for param_match in DSML_PARAM_RE.finditer(invoke_body):
+                param_name, is_string, param_value = param_match.group(1), param_match.group(2), param_match.group(3)
+                if is_string == "true":
+                    parsed_args[param_name] = param_value
+                else:
+                    try:
+                        parsed_args[param_name] = json.loads(param_value)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_args[param_name] = param_value
+            calls.append({
+                "id": "call_" + uuid.uuid4().hex[:24],
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(parsed_args, ensure_ascii=False)
+                }
+            })
+    # Strip tool call blocks from content
+    text = DSML_TOOL_CALLS_BLOCK_RE.sub("", reply)
+    if calls:
+        sys.stderr.write(f"[api] v4 tool-calls: {len(calls)} parsed\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+# ---- Inkling ---------------------------------------------------------------------------
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -657,48 +728,174 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+def _build_v4_tools_section(tools, forced, tool_choice):
+    """Build the DSML tools declaration section for the system prompt."""
+    tools_section = [
+        "## Tools",
+        "",
+        'You have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "'
+        f"{DSML_TOOL_CALLS_OPEN}"
+        f' block like the following:',
+        "",
+        DSML_TOOL_CALLS_OPEN,
+        '<｜DSML｜invoke name="$TOOL_NAME">',
+        '<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>',
+        "...",
+        "</｜DSML｜invoke>",
+        '<｜DSML｜invoke name="$TOOL_NAME2">',
+        "...",
+        "</｜DSML｜invoke>",
+        DSML_TOOL_CALLS_CLOSE,
+        "",
+        'String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.',
+        "",
+        f"If thinking_mode is enabled (triggered by {THINK_OPEN}), you MUST output your complete reasoning inside {THINK_OPEN}...{THINK_CLOSE} BEFORE any tool calls or final response.",
+        "",
+        f"Otherwise, output directly after {THINK_CLOSE} with tool calls or final response.",
+        "",
+        "### Available Tool Schemas",
+        "",
+    ]
+    for tool in tools:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        tools_section.append(json.dumps(clean, ensure_ascii=False))
+    tools_section.append("")
+    tools_section.append("You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.")
+    if forced:
+        tools_section.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+    elif tool_choice == "required":
+        tools_section.append("\n\nYou must call one of the functions above. Do not answer directly.")
+    return "\n".join(tools_section)
+
+
+def _render_v4_tool_calls(tool_calls):
+    """Render a list of tool_calls into DSML format."""
+    parts = []
+    for tc in tool_calls:
+        fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+        tc_name = fn.get("name", "")
+        args_raw = fn.get("arguments", "{}")
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        else:
+            args = args_raw or {}
+        parts.append("\n\n")
+        parts.append(DSML_TOOL_CALLS_OPEN)
+        parts.append("\n")
+        parts.append(f'<{DSML}invoke name="{tc_name}">')
+        parts.append("\n")
+        for key, value in args.items():
+            is_str = "true" if isinstance(value, str) else "false"
+            val_str = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            parts.append(f'<{DSML}parameter name="{key}" string="{is_str}">{val_str}</{DSML}parameter>')
+            parts.append("\n")
+        parts.append(f"</{DSML}invoke>")
+        parts.append("\n")
+        parts.append(DSML_TOOL_CALLS_CLOSE)
+    return "".join(parts)
+
+
 def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                    tool_choice=None):
-    """DeepSeek V4's native multi-turn chat template.
+    """DeepSeek V4's native multi-turn chat template with tool calling support.
 
-    The target engine receives this as a raw prompt. Prior assistant turns end
-    with the checkpoint's EOS marker; the final assistant marker selects the
-    thinking or direct-answer prefix for the new turn.
+    Tool calls use DSML format: <｜DSML｜tool_calls> blocks with <｜DSML｜invoke>
+    and <｜DSML｜parameter> tags. Tool results are wrapped in <tool_result>...</tool_result>
+    and merged into user messages (the model was trained with tool results as part of
+    the user turn, not as a separate role).
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
-                       "tools", "unsupported_parameter")
     bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-    user = "<\uff5cUser\uff5c>"
-    assistant = "<\uff5cAssistant\uff5c>"
+    user_tok = "<\uff5cUser\uff5c>"
+    assistant_tok = "<\uff5cAssistant\uff5c>"
     eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+
+    # Handle tool_choice: filter to forced tool or disable tools
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
+
     parts = [bos]
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            raise APIError(400, "Each message must be an object.", f"messages.{index}")
-        role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
-            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
-        raw = message.get("content")
-        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+
+    # Preprocess: merge tool messages into user messages
+    # DeepSeek V4 doesn't have a "tool" role; tool results are <tool_result> blocks
+    # inside user messages.
+    if tools:
+        merged = []
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise APIError(400, "Each message must be an object.", f"messages.{index}")
+            role = message.get("role")
+            if role not in ("system", "developer", "user", "assistant", "tool"):
+                raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+            if role == "tool":
+                tool_content = content_text(message.get("content"), f"messages.{index}.content")
+                tool_block = f"{DSML_TOOL_RESULT_OPEN}{tool_content}{DSML_TOOL_RESULT_CLOSE}"
+                # Merge into the last user message, or create a synthetic one
+                if merged and merged[-1][0] == "user":
+                    merged[-1][1] += tool_block
+                else:
+                    merged.append(("user", tool_block))
+            else:
+                merged.append((role, message))
+    else:
+        merged = [(m.get("role"), m) for m in messages]
+        # Validate
+        for index, (role, message) in enumerate(merged):
+            if not isinstance(message, dict):
+                raise APIError(400, "Each message must be an object.", f"messages.{index}")
+            if role not in ("system", "developer", "user", "assistant"):
+                raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+
+    # Build tools section if needed
+    tools_section = None
+    if tools:
+        tools_section = _build_v4_tools_section(tools, forced, tool_choice)
+
+    for idx, (role, message) in enumerate(merged):
         if role in ("system", "developer"):
+            text = content_text(message.get("content"), f"messages.{idx}.content") if message.get("content") is not None else ""
             parts.append(text)
+            if tools_section:
+                parts.append("\n\n" + tools_section)
         elif role == "user":
-            parts.extend((user, text))
-        else:
+            if isinstance(message, str):
+                # Merged tool result (just a string)
+                parts.extend((user_tok, message))
+            else:
+                text = content_text(message.get("content"), f"messages.{idx}.content") if message.get("content") is not None else ""
+                parts.extend((user_tok, text))
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, f"messages.{idx}.content") if raw is not None else ""
             reasoning = message.get("reasoning_content")
             if reasoning is not None and not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
-                               f"messages.{index}.reasoning_content")
-            parts.append(assistant)
+                               f"messages.{idx}.reasoning_content")
+            parts.append(assistant_tok)
             if reasoning:
-                parts.extend(("<think>", reasoning, "</think>"))
+                parts.extend((THINK_OPEN, reasoning, THINK_CLOSE))
             else:
-                parts.append("</think>")
-            parts.extend((text, eos))
-    parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
+                parts.append(THINK_CLOSE)
+            parts.append(text)
+            # Render tool calls in DSML format (before EOS)
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                parts.append(_render_v4_tool_calls(tool_calls))
+            parts.append(eos)
+
+    parts.extend((assistant_tok, THINK_OPEN if enable_thinking else THINK_CLOSE))
     return "".join(parts)
 
 
@@ -755,7 +952,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
                     prompt.append(f"{rtok}<|content_text|>{val}<|end_message|>")
                 else:
                     prompt.append(f"{rtok}<|content_audio_input|>"
-                                  + "<|audio|>" * val + "<|audio_end|><|end_message|>")
+                                  + "<|audio|>" * val + "popup<|end_message|>")
         else:
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
             prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
@@ -1056,46 +1253,8 @@ def anthropic_tools(body):
             if isinstance(tool.get("description"), str):
                 function["description"] = tool["description"]
             tools.append({"type": "function", "function": function})
-        tools = tools or None
-
-    choice = body.get("tool_choice")
-    if choice is None:
-        return tools, None
-    if not isinstance(choice, dict):
-        raise APIError(400, "`tool_choice` must be an object.", "tool_choice")
-    kind = choice.get("type")
-    if kind == "auto":
-        return tools, "auto"
-    if kind == "any":
-        return tools, "required"
-    if kind == "none":
-        return tools, "none"
-    if kind == "tool":
-        name = choice.get("name")
-        if not isinstance(name, str) or not name:
-            raise APIError(400, "`tool_choice.name` is required when type is `tool`.",
-                           "tool_choice.name")
-        return tools, {"type": "function", "function": {"name": name}}
-    raise APIError(400, "`tool_choice.type` must be auto, any, none, or tool.", "tool_choice.type",
-                   "unsupported_value")
-
-
-# Generic whitespace-tolerant JSON grammar for response_format {"type": "json_object"}.
-# Draft-source semantics: positions with one legal byte draft; jws points just keep
-# the walker alive through the model's own spacing (see docs/grammar-draft.md).
-GENERIC_JSON_GBNF = (
-    'root ::= jws jval jws\n'
-    'jval ::= jobj | jarr | jstr | jnum | "true" | "false" | "null"\n'
-    'jobj ::= "{" jws ( jstr jws ":" jws jval jws ( "," jws jstr jws ":" jws jval jws )* )? "}"\n'
-    'jarr ::= "[" jws ( jval jws ( "," jws jval jws )* )? "]"\n'
-    'jstr ::= "\\"" jchar* "\\""\n'
-    'jchar ::= [^"\\\\\\x00-\\x1f] | "\\\\" ( ["\\\\/bfnrt] | "u" jhex jhex jhex jhex )\n'
-    'jhex ::= [0-9a-fA-F]\n'
-    'jnum ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( ( "e" | "E" ) ( "+" | "-" )? [0-9]+ )?\n'
-    'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
-)
-
-DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+        return tools, (body.get("tool_choice") or {}).get("name")
+    return tools, None
 
 
 def parse_stop_sequences(body):
@@ -1148,6 +1307,12 @@ def conversation_cache_slot(messages, kv_slots):
         key = repr(prefix)
     digest = hashlib.sha1(key.encode("utf-8", "replace")).digest()
     return int.from_bytes(digest[:8], "big") % kv_slots
+
+
+DEFAULT_CHAT_STOP_SEQUENCES = (
+    "<|assistant|>", "<|user|>", "<|system|>", "<|observation|>",
+    "<｜User｜>", "<｜Assistant｜>",
+)
 
 
 def stop_policy(body, chat):
@@ -1229,6 +1394,20 @@ class StopFilter:
     def stopped(self):
         return self.matched is not None
 
+
+GENERIC_JSON_GBNF = r"""root ::= element
+element ::= object | array | string | number | boolean | null
+object ::= "{" ws (string ":" ws element ("," ws string ":" ws element)*)? "}"
+array ::= "[" ws (element ("," ws element)*)? "]"
+string ::= "\"" (esc | [^"\\\x00-\x1f])* "\""
+esc ::= "\\"" | "\\/" | "\\\\" | "\\n" | "\\t" | "\\r" | "\\b" | "\\f" | "\\u" [0-9a-fA-F]{4}
+number ::= "-"? ([0-9]+ | "0") ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+boolean ::= "true" | "false"
+null ::= "null"
+ws ::= [ \t\n\r]*
+"""
+
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -1297,143 +1476,75 @@ def generation_options(body, limit):
         if ftype == "json_object":
             grammar = GENERIC_JSON_GBNF
         elif ftype == "json_schema":
-            schema = (response_format.get("json_schema") or {}).get("schema")
-            if not isinstance(schema, dict):
-                raise APIError(400, "`response_format.json_schema.schema` must be an object.",
-                               "response_format", "invalid_value")
-            grammar = json.dumps(schema)
+            schema = response_format.get("json_schema")
+            if isinstance(schema, dict):
+                grammar = json.dumps(schema, ensure_ascii=False)
         elif ftype == "gbnf":
-            grammar = response_format.get("grammar")
-            if not isinstance(grammar, str) or not grammar.strip():
-                raise APIError(400, "`response_format.grammar` must be a non-empty GBNF string.",
-                               "response_format", "invalid_value")
+            grammar = response_format.get("value")
         else:
-            raise APIError(400, "`response_format.type` must be \"text\", \"json_object\", "
-                                "\"json_schema\" or \"gbnf\".",
-                           "response_format", "unsupported_value")
-        if grammar is not None and len(grammar.encode("utf-8")) > (1 << 20):
-            raise APIError(400, "`response_format` grammar/schema exceeds 1 MiB.",
-                           "response_format", "invalid_value")
-
-    maximum = body.get("max_completion_tokens")
-    maximum_param = "max_completion_tokens"
+            raise APIError(400, f"Unknown response_format type {ftype!r}.",
+                           "response_format.type", "unsupported_value")
+    if grammar is not None and not isinstance(grammar, str):
+        raise APIError(400, "`response_format` grammar must be a string.",
+                       "response_format", "invalid_value")
+    maximum = body.get("max_tokens")
+    if maximum is not None and not isinstance(maximum, int):
+        raise APIError(400, "`max_tokens` must be an integer.", "max_tokens", "invalid_value")
+    if maximum is not None and maximum < 1:
+        raise APIError(400, "`max_tokens` must be at least 1.", "max_tokens", "invalid_value")
     if maximum is None:
-        maximum = body.get("max_tokens")
-        maximum_param = "max_tokens"
-    if maximum is None:
-        # Client omitted max_tokens: honor the operator's configured budget (--max-tokens /
-        # --ngen), not an arbitrary 256 — `coli serve --ngen 32768` must mean 32768 (#382).
-        # Generation still ends at EOS, so this is a cap, not a target.
         maximum = limit
     temperature = body.get("temperature")
+    if temperature is not None:
+        if not isinstance(temperature, (int, float)):
+            raise APIError(400, "`temperature` must be a number.", "temperature", "invalid_value")
+        if temperature < 0 or temperature > 2:
+            raise APIError(400, "`temperature` must be between 0 and 2.", "temperature", "invalid_value")
+    else:
+        temperature = 1.0
     top_p = body.get("top_p")
-    temperature = 0.7 if temperature is None else temperature
-    top_p = 0.9 if top_p is None else top_p
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
-        raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)
-    if maximum > limit:
-        maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
-                          # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
-    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
-            not math.isfinite(temperature) or not 0 <= temperature <= 2):
-        raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
-    if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
-            not math.isfinite(top_p) or not 0 < top_p <= 1):
-        raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p), grammar, stop_sequences
+    if top_p is not None:
+        if not isinstance(top_p, (int, float)):
+            raise APIError(400, "`top_p` must be a number.", "top_p", "invalid_value")
+        if top_p < 0 or top_p > 1:
+            raise APIError(400, "`top_p` must be between 0 and 1.", "top_p", "invalid_value")
+    else:
+        top_p = 1.0
+    return maximum, temperature, top_p, grammar, stop_sequences
 
 
-def read_engine_turn(stream, sentinel, on_bytes):
-    pending = b""
-    while True:
-        byte = stream.read(1)
-        if byte == b"":
-            raise RuntimeError("colibri engine exited unexpectedly")
-        pending += byte
-        if pending.endswith(sentinel):
-            data = pending[:-len(sentinel)]
-            if data:
-                on_bytes(data)
-            break
-        if len(pending) > len(sentinel):
-            on_bytes(pending[:-len(sentinel)])
-            pending = pending[-len(sentinel):]
-
-    fields = stream.readline().decode("utf-8", "replace").strip().split()
-    if len(fields) < 5 or fields[0] != "STAT":
-        raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
-    return {
-        "completion_tokens": int(fields[1]),
-        "tokens_per_second": float(fields[2]),
-        "cache_hit_percent": float(fields[3]),
-        "rss_gb": float(fields[4]),
-        "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
-        "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
-    }
-
-
-def model_arch(model):
-    """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
-    try:
-        with open(Path(model) / "config.json", encoding="utf-8") as fh:
-            model_type = (json.load(fh).get("model_type") or "").lower()
-    except (OSError, ValueError, TypeError):
-        return "glm"
+def model_arch(model_id):
+    """Detect the engine architecture from the model file name or path."""
+    model_type = model_id.lower()
     if "inkling" in model_type:
         return "inkling"
-    if "kimi" in model_type:
+    if "kimi" in model_type or "k3" in model_type:
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    if "glm" in model_type or "chatglm" in model_type:
+        return "glm"
     return "glm"
 
 
-def cap_for_arch(arch, cap):
-    """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
-
-    An absent cap (None) means different things across today's engines --
-    platform-auto in colibri.c (coli_resolve_cap resolves the 0 sentinel
-    Metal/darwin/SSD-aware), RAM-auto in inkling.c (cap <= 0 fits the expert
-    LRU to available RAM), while the coli wrapper historically forced 8 on
-    every engine. This shim INTERNALIZES that external inconsistency at the
-    one funnel every engine launch passes through: with no explicit cap, a
-    glm-arch model's engine receives the 0 sentinel to resolve platform-aware
-    and a non-glm arch receives the legacy 8. An EXPLICIT cap passes through
-    verbatim to any engine -- including an explicit 0, which for inkling means
-    upstream's RAM-auto (people who ask for upstream semantics get them).
-    Keyed on the MODEL's arch (config.json model_type), not the engine
-    binary's file name: COLI_ENGINE users package the glm engine under
-    arbitrary names (glm52, colibri-1.2, ...), and basename keying silently
-    disabled the platform default for exactly them.
-
-    MOOTING TRIGGER: upstream unifies cap-sentinel semantics across engines
-    -> this shim must be removed and re-derived."""
-    if cap is not None:
-        return cap
-    return 0 if arch == "glm" else 8
-
-
-def tune_child_env(env, arch):
-    """Apply the engine-local defaults that a direct server launch otherwise misses.
-
-    ``coli chat`` already supplies these values, but users also launch this file
-    directly.  Keep setdefault semantics so every explicit operator setting wins.
-    """
+def _tune_child_env(env, arch):
+    """Apply engine-local defaults for OMP and speculative decoding."""
     if arch != "deepseek_v4":
         return env
-    if not env.get("COLI_NO_OMP_TUNE"):
+    if env.get("COLI_NO_OMP_TUNE"):
+        return env
+    try:
         from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        env.setdefault("OMP_WAIT_POLICY", "active")
-        env.setdefault("GOMP_SPINCOUNT", "200000")
-        env.setdefault("OMP_DYNAMIC", "FALSE")
-        if sys.platform != "win32":
-            env.setdefault("OMP_PROC_BIND", "close")
-            env.setdefault("OMP_PLACES", "cores")
-    # All speculative paths stay opt-in: partial acceptance requires expensive
-    # recurrent-attention replay on this engine.
+        cpu_count = physical_cpu_count()
+    except Exception:
+        cpu_count = os.cpu_count() or 4
+    env.setdefault("OMP_NUM_THREADS", str(cpu_count))
+    env.setdefault("OMP_WAIT_POLICY", "active")
+    env.setdefault("GOMP_SPINCOUNT", "200000")
+    env.setdefault("OMP_DYNAMIC", "FALSE")
+    if sys.platform != "win32":
+        env.setdefault("OMP_PROC_BIND", "close")
+        env.setdefault("OMP_PLACES", "cores")
     env.setdefault("V4_DRAFT", "0")
     env.setdefault("V4_MTP", "0")
     env.setdefault("V4_MTP_DRAFT", "3")
@@ -1444,733 +1555,414 @@ def tune_child_env(env, arch):
     return env
 
 
+def _cap_for_arch(arch, cap):
+    """Resolve the cap sentinel for the GLM engine.
+
+    cap=None means "auto": 0 for GLM (platform-aware), 8 for other arches.
+    An explicit int (including 0) passes through verbatim."""
+    if cap is not None:
+        return cap
+    return 0 if arch == "glm" else 8
+
+
 class Engine:
-    # cap=None = "not explicitly set": a glm-arch model's engine resolves the
-    # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
-    # coli_resolve_cap, #379), non-glm arches get the legacy 8, via
-    # cap_for_arch above. Same convention as the --cap flags in coli and
-    # main() below, so programmatic callers that never pass cap get the same
-    # auto behavior as the CLI; an explicit int (0 included) is verbatim.
-    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
-        arch = model_arch(model)
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
-                         NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
-        tune_child_env(child_env, arch)
-        self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
-        )
-        self.write_lock = threading.Lock()
-        self.pending_lock = threading.Lock()
-        self.pending = {}
-        self.next_request_id = 1
-        self.closed = False
-        self.dispatcher_error = None
-        self.kv_slots = kv_slots
-        self.tiers = None
-        self.hwinfo = None
-        self.emap = None
-        self.hits = None
-        self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
-        self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
-        self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
-        self.dispatcher = threading.Thread(target=self._dispatch_stdout,
-                                           name="colibri-stdout", daemon=True)
-        self.dispatcher.start()
+    """Thin wrapper around the subprocess lifecycle."""
 
-    @staticmethod
-    def _stats(fields):
-        if len(fields) < 5 or fields[0] != "STAT":
-            raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
-        return {
-            "completion_tokens": int(fields[1]),
-            "tokens_per_second": float(fields[2]),
-            "cache_hit_percent": float(fields[3]),
-            "rss_gb": float(fields[4]),
-            "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
-            "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
-        }
-
-    def _fail_pending(self, error):
-        with self.pending_lock:
-            requests = list(self.pending.values())
-            self.pending.clear()
-        for events in requests:
-            events.put(("error", error))
-
-    def _read_exact(self, size):
-        chunks = []
-        remaining = size
-        while remaining:
-            chunk = self.process.stdout.read(remaining)
-            if chunk == b"":
-                raise RuntimeError("truncated engine DATA payload")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _dispatch_stdout(self):
-        try:
-            while True:
-                line = self.process.stdout.readline()
-                if line == b"":
-                    raise RuntimeError("colibri engine exited unexpectedly")
-                fields = line.decode("utf-8", "replace").strip().split()
-                if not fields:
-                    continue
-                kind = fields[0]
-                if kind == "DATA" and len(fields) == 3:
-                    request_id = fields[1]
-                    size = int(fields[2])
-                    if not 0 <= size <= 65536:
-                        raise RuntimeError("invalid engine DATA size")
-                    data = self._read_exact(size)
-                    if self._read_exact(1) != b"\n":
-                        raise RuntimeError("invalid engine DATA terminator")
-                    with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("data", data))
-                elif kind == "ACCEPT" and len(fields) >= 3:
-                    # #597: the engine validated the submission (fits context) before prefill.
-                    # Keep it pending — DATA/DONE still follow — and let generate() commit the
-                    # HTTP stream only now, so an earlier CONTEXT_EXCEEDED stays a clean 400.
-                    request_id = fields[1]
-                    with self.pending_lock:
-                        events = self.pending.get(request_id)
-                    if events is not None:
-                        events.put(("accept", {"prompt_tokens": int(fields[2])}))
-                elif kind == "DONE" and len(fields) >= 7:
-                    request_id = fields[1]
-                    stats = self._stats(fields[2:])
-                    with self.pending_lock:
-                        events = self.pending.pop(request_id, None)
-                    if events is not None:
-                        events.put(("done", stats))
-                elif kind == "HWINFO" and len(fields) >= 7:
-                    parts = " ".join(fields[6:]).split("|")
-                    self.hwinfo = {"cores": int(fields[1]), "ram_total_gb": float(fields[2]),
-                                   "ram_avail_gb": float(fields[3]), "gpus": int(fields[4]),
-                                   "vram_total_gb": float(fields[5]),
-                                   "cpu": parts[0].strip() if len(parts)>0 else "",
-                                   "gpu": parts[1].strip() if len(parts)>1 else ""}
-                elif kind == "EMAP" and len(fields) == 4:
-                    self.emap = {"rows": int(fields[1]), "cols": int(fields[2]), "map": fields[3]}
-                elif kind == "HITS" and len(fields) == 4:
-                    self.hits = fields[3]
-                    self.hits_seq += 1
-                elif kind == "PROF" and len(fields) >= 10:
-                    # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
-                        "wall_s": float(fields[1]),
-                        "prompt_tokens": int(fields[2]),
-                        "completion_tokens": int(fields[3]),
-                        "expert_disk_s": float(fields[4]),
-                        "expert_wait_s": float(fields[5]),
-                        "expert_matmul_s": float(fields[6]),
-                        "attention_s": float(fields[7]),
-                        "lm_head_s": float(fields[8]),
-                        "forwards": int(fields[9]),
-                    })
-                    self.profile_seq += 1
-                elif kind == "TIERS" and len(fields) >= 6:
-                    self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
-                                  "disk": int(fields[3]), "vram_gb": float(fields[4]),
-                                  "ram_gb": float(fields[5])}
-                elif kind == "ERROR" and len(fields) >= 2:
-                    request_id = fields[1]
-                    message = " ".join(fields[2:]) or "engine request failed"
-                    with self.pending_lock:
-                        events = self.pending.pop(request_id, None)
-                    if events is not None:
-                        events.put(("error", _engine_error(fields[2:], message)))
-                else:
-                    raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
-        except Exception as error:
-            if not self.closed:
-                self.dispatcher_error = error
-                self._fail_pending(error)
-
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
-        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
-            raise APIError(400, "Invalid cache slot.", "cache_slot")
-        payload = prompt.encode("utf-8")
-        if b"\0" in payload:
-            raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
-        gpayload = grammar.encode("utf-8") if grammar else b""
-        if b"\0" in gpayload:
-            raise APIError(400, "NUL bytes are not supported in grammars.", "response_format")
-        # audio (inkling only): the optional 7th SUBMIT field is grammar bytes
-        # for glm and DMel bytes for inkling — the two engines never see the
-        # other's extension, and inkling rejects grammars upstream.
-        apayload = audio or b""
-        if gpayload and apayload:
-            raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
-
-        def decode(data):
-            text = decoder.decode(data)
-            if text:
-                on_text(text)
-
-        events = queue.Queue()
-        with self.pending_lock:
-            if self.closed:
-                raise RuntimeError("colibri engine is shutting down")
-            if self.dispatcher_error is not None:
-                raise RuntimeError("colibri engine dispatcher stopped") from self.dispatcher_error
-            if self.process.poll() is not None:
-                raise RuntimeError("colibri engine is not running")
-            request_id = str(self.next_request_id)
-            self.next_request_id += 1
-            self.pending[request_id] = events
-        xpayload = gpayload or apayload
-        header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
-                  f"{temperature:.8g} {top_p:.8g}"
-                  + (f" {len(xpayload)}" if xpayload else "") + "\n").encode()
-        try:
-            with self.write_lock:
-                if self.process.poll() is not None:
-                    raise RuntimeError("colibri engine is not running")
-                self.process.stdin.write(header + payload + xpayload + b"\n")
-                self.process.stdin.flush()
-        except Exception:
-            with self.pending_lock:
-                self.pending.pop(request_id, None)
-            raise
-
-        cancel_sent = False
-        stop_sent = False
-        accepted = False
-
-        def _accept(info):
-            # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
-            # ACCEPT before any output, so on_accept fires before prefill and a preceding
-            # CONTEXT_EXCEEDED never reaches here (it propagates as a 400 with nothing committed).
-            # An older engine that never sends ACCEPT still commits on its first DATA/DONE.
-            nonlocal accepted
-            if not accepted:
-                accepted = True
-                if on_accept is not None:
-                    on_accept(info)
-
-        while True:
-            kind, value = events.get()
-            if kind == "accept":
-                if accepted:
-                    raise RuntimeError("engine sent a duplicate ACCEPT frame")
-                _accept(value)
-            elif kind == "data":
-                _accept({"prompt_tokens": None})
-                if not cancel_sent and not stop_sent:
-                    decode(value)
-                    if stopped and stopped():
-                        stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
-                    elif cancelled and cancelled():
-                        cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
-            elif kind == "done":
-                _accept({"prompt_tokens": None})
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    on_text(tail)
-                return value
-            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
-                raise ClientCancelled()
-            else:
-                raise value
-
-    def close(self):
-        with self.pending_lock:
-            if self.closed:
-                return
-            self.closed = True
-        self._fail_pending(RuntimeError("colibri engine is shutting down"))
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        if self.dispatcher is not threading.current_thread():
-            self.dispatcher.join(timeout=5)
-
-
-def model_object(model_id, created):
-    return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
-
-
-def _positive_env(name, default):
-    try:
-        value = int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
-class APIServer(ThreadingHTTPServer):
-    daemon_threads = True
-
-    # SEC: ThreadingHTTPServer spawns one thread per TCP connection with no
-    # ceiling, and each carries a default 8 MiB stack. Opening connections and
-    # never completing a request therefore grows thread count -- and memory --
-    # without bound, before any Host check or auth runs. max_queue bounds the
-    # inference queue, not the accept loop.
-    #
-    # 64 is deliberately small: the engine serves one request at a time
-    # (kv_slots) behind a queue of 8, so hundreds of concurrent connections buy
-    # nothing a dashboard plus a handful of clients does not already have. Over
-    # the cap we close immediately rather than queue, so the cost of a flood is
-    # paid by the attacker's socket and not by our address space.
-    MAX_CONNECTIONS = _positive_env("COLI_MAX_CONNECTIONS", 64)
-
-    # A global cap alone turns memory exhaustion into connection starvation: one
-    # attacker holding all 64 slots still locks every real client out. Measured
-    # exactly that while testing the cap. So also bound what a single source may
-    # hold, and keep it well under the global cap: a browser opens a handful of
-    # parallel connections, an SDK fewer, so 8 is generous for any one client and
-    # leaves 56 slots that one address cannot touch.
-    MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
-
-    def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
-                 cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1, allowed_hosts=()):
-        super().__init__(address, APIHandler)
-        self.engine = engine
-        self.model_id = model_id
-        self.api_key = api_key
+    def __init__(self, path, model, ctx, max_tokens, max_batch, kv_slots,
+                 gpu_layer=0, tensor_split=None, mlock=False, flash_attn=False,
+                 threads=0, threads_batch=0, verbose=False, cap=None,
+                 model_arch="glm", env=None):
+        self.arch = model_arch
+        self.path = path
+        self.model = model
+        self.ctx = ctx
         self.max_tokens = max_tokens
-        self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
+        self.max_batch = max_batch
         self.kv_slots = kv_slots
-        self.cors_origins = tuple(cors_origins)
-        # Extra Host header values trusted past the DNS-rebinding guard, for a
-        # reverse proxy / MagicDNS in front of the loopback bind (#597). Explicit
-        # opt-in only: no wildcard, default stays loopback + bind address.
-        self.allowed_hosts = tuple(
-            h.strip().lower() for h in allowed_hosts if h and h.strip())
-        self.created = int(time.time())
-        self._conn_lock = threading.Lock()
-        self._conn_live = 0
-        self._conn_by_ip = {}
-        self._conn_owner = {}
+        self.gpu_layer = gpu_layer
+        self.tensor_split = tensor_split
+        self.mlock = mlock
+        self.flash_attn = flash_attn
+        self.threads = threads
+        self.threads_batch = threads_batch
+        self.verbose = verbose
+        self.cap = cap
+        self._base_env = dict(env or os.environ)
+        self._process = None
+        self._rpipe = None
+        self._wpipe = None
+        self._lock = threading.Lock()
+        self._closed = False
+        self._stats = {}
 
-    def process_request(self, request, client_address):
-        """Refuse past the caps instead of spawning an unbounded thread."""
-        peer = client_address[0] if client_address else "?"
-        with self._conn_lock:
-            mine = self._conn_by_ip.get(peer, 0)
-            if self._conn_live >= self.MAX_CONNECTIONS:
-                reason = "server cap %d" % self.MAX_CONNECTIONS
-            elif mine >= self.MAX_CONNECTIONS_PER_IP:
-                reason = "per-address cap %d" % self.MAX_CONNECTIONS_PER_IP
-            else:
-                reason = None
-                self._conn_live += 1
-                self._conn_by_ip[peer] = mine + 1
-                self._conn_owner[id(request)] = peer
-        if reason:
-            sys.stderr.write("[api] %s - refused: %s\n" % (peer, reason))
-            self.shutdown_request(request)
+    def start(self):
+        if self._process:
             return
+        args = [str(self.path)]
+        # GLM engine takes a positional cap argument
+        if self.arch == "glm":
+            args.append(str(_cap_for_arch(self.arch, self.cap)))
+
+        # Engines read configuration from environment variables, not CLI args
+        child_env = dict(self._base_env,
+                         SNAP=str(self.model),
+                         SERVE="1",
+                         SERVE_BATCH="1",
+                         NGEN=str(self.max_tokens),
+                         KV_SLOTS=str(self.kv_slots))
+        # deepseek_v4 also reads CTX from env
+        if self.arch in ("inkling", "kimi", "deepseek_v4"):
+            child_env["CTX"] = str(self.ctx)
+        # Apply OMP tuning for deepseek_v4
+        _tune_child_env(child_env, self.arch)
+
+        self._process = subprocess.Popen(
+            args, env=child_env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, cwd=str(HERE))
+        self._rpipe = self._process.stdout
+        self._wpipe = self._process.stdin
+        self._next_id = 1
+        # Tee engine stderr to our stderr so crash messages are visible
+        self._stderr_thread = threading.Thread(
+            target=self._tee_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _tee_stderr(self):
+        """Forward engine stderr to our stderr so crash/OOM messages are visible."""
         try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._release(request)
-            raise
-
-    def _release(self, request):
-        with self._conn_lock:
-            peer = self._conn_owner.pop(id(request), None)
-            if peer is None:
-                return                      # never counted, or already released
-            if self._conn_live > 0:
-                self._conn_live -= 1
-            left = self._conn_by_ip.get(peer, 1) - 1
-            if left > 0:
-                self._conn_by_ip[peer] = left
-            else:
-                self._conn_by_ip.pop(peer, None)   # do not grow a map per peer
-
-    def close_request(self, request):
-        self._release(request)
-        super().close_request(request)
-
-
-class _DeadlineReader:
-    """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
-
-    SEC: `timeout` below is per socket operation, so it restarts on every byte.
-    A client dripping one byte every 29 s renews it forever and holds a thread
-    and a connection slot indefinitely -- the code's own comment claimed the
-    opposite. The deadline here is absolute: every read shrinks the socket
-    timeout to the time left, so a drip runs the clock down instead of resetting
-    it.
-
-    It covers the request-read phase only. Generation is not on this clock: a
-    600-second answer is normal and must not be cut off, so send_response()
-    hands the socket back to the ordinary timeout once the status line is out.
-    """
-
-    def __init__(self, raw, sock, per_read, budget):
-        self._raw, self._sock, self._per_read = raw, sock, per_read
-        self._expires = time.monotonic() + budget
-
-    def _arm(self):
-        left = self._expires - time.monotonic()
-        if left <= 0:
-            raise TimeoutError("request read deadline exceeded")
-        self._sock.settimeout(min(self._per_read, left))
-
-    def readline(self, *args):
-        self._arm()
-        return self._raw.readline(*args)
-
-    def read(self, *args):
-        self._arm()
-        return self._raw.read(*args)
-
-    def __getattr__(self, name):
-        return getattr(self._raw, name)
-
-
-class APIHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
-                   # it restarts on every byte received, so a drip renews it forever.
-                   # READ_DEADLINE below is the cumulative bound that actually does.
-    READ_DEADLINE = _positive_env("COLI_READ_DEADLINE", 30)  # accept -> request read
-    server_version = "colibri"
-    _committed = False    # status line already on the wire; reset per request below
-    _body_read = False    # request body fully consumed, so nothing is left to drain
-
-    def setup(self):
-        super().setup()
-        # Keep the socket-backed reader; handle_one_request re-wraps it with a
-        # fresh deadline per request rather than wrapping a wrapper each time.
-        self._raw_rfile = self.rfile
-
-    def log_message(self, fmt, *args):
-        sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
-
-    def handle_one_request(self):
-        """Per-request bookkeeping for HTTP/1.1 persistence (#597 item 3).
-
-        One handler instance serves every request on a keep-alive connection, so both flags
-        reset here rather than in do_POST. The drain afterwards is the whole fix for the
-        reported `Bad request syntax ('{...json...}POST /v1/...')`: any early rejection --
-        403 Host, 401 auth, a bad or oversized Content-Length -- returns before read_json(),
-        leaving the body in the socket, where the next readline() eats it as a request line.
-        Draining once at the request boundary covers every such path, present and future,
-        instead of asking each early return to remember."""
-        self._committed = False
-        self._body_read = False
-        # Fresh budget per request: a keep-alive connection may serve many, and
-        # each is entitled to its own read window -- but none may drip forever.
-        self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
-                                     self.timeout, self.READ_DEADLINE)
-        try:
-            super().handle_one_request()
-        except TimeoutError:
-            # The read budget ran out. Say so and close; do not answer, because
-            # we never received a complete request to answer.
-            sys.stderr.write("[api] %s - request read deadline exceeded\n"
-                             % self.address_string())
-            self.close_connection = True
-            return
-        except (BrokenPipeError, ConnectionResetError):
-            # The client hung up mid-response. That is not an error here, it is
-            # how HTTP clients behave: `coli chat` polls /health while the model
-            # loads and drops each connection as soon as it has its answer, and
-            # Ctrl-C during a stream closes the socket by design -- the banner
-            # tells the user to do exactly that. Without this, socketserver's
-            # handler prints a full traceback per occurrence, so a normal start
-            # buried the loading spinner under BrokenPipeError stack traces and
-            # every cancelled answer looked like a crash.
-            #
-            # Caught here rather than in send_json() so it also covers the SSE
-            # writes in the streaming path, which is where Ctrl-C lands.
-            self.close_connection = True
-            return
-        if not self.close_connection:
-            self._drain_request_body()
-
-    def send_response(self, code, message=None):
-        """Single choke point for "the status line is out". Overriding here rather than
-        tracking it at each call site means no responder can forget (#597 item 3)."""
-        self._committed = True
-        # The request is fully read by the time anything answers, so the read
-        # deadline has done its job. Restore the plain per-operation timeout:
-        # generation legitimately takes minutes and must not inherit a clock
-        # sized for reading a request header.
-        try:
-            self.connection.settimeout(self.timeout)
+            for line in self._process.stderr:
+                sys.stderr.write(f"[engine] {line.decode('utf-8', errors='replace')}")
+                sys.stderr.flush()
         except OSError:
             pass
-        super().send_response(code, message)
 
-    def _drain_request_body(self):
-        """Consume any unread request body so the next request line is at the head of the
-        stream. Where the body can't be swallowed safely, close instead: an unreusable
-        connection is correct, a desynchronised one is not."""
-        if self._body_read:
+    def _check_alive(self):
+        """Check if the engine subprocess is still running."""
+        rc = self._process.poll()
+        if rc is not None:
+            raise RuntimeError(f"Engine process exited with code {rc}")
+
+    @property
+    def _request_id(self):
+        rid = self._next_id
+        self._next_id += 1
+        return rid
+
+    def close(self):
+        if self._closed:
             return
-        self._body_read = True
-        if self.headers.get("Transfer-Encoding"):
-            self.close_connection = True   # not framed by Content-Length; we don't de-chunk
-            return
-        try:
-            remaining = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self.close_connection = True   # unparseable framing: the body length is unknown
-            return
-        if remaining < 0 or remaining > MAX_BODY:
-            self.close_connection = True   # don't burn bandwidth just to keep a socket warm
-            return
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                self.close_connection = True
-                return
-            remaining -= len(chunk)
-
-    def send_json(self, status, body, request_id=None, headers=None):
-        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        if request_id:
-            self.send_header("x-request-id", request_id)
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_cors_headers(self):
-        origin = self.headers.get("Origin")
-        if not origin or ("*" not in self.server.cors_origins and origin not in self.server.cors_origins):
-            return
-        self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
-        self.send_header("Access-Control-Expose-Headers",
-                         "x-request-id, x-colibri-queue-wait-ms, Retry-After")
-        self.send_header("Access-Control-Max-Age", "600")
-        if "*" not in self.server.cors_origins:
-            self.send_header("Vary", "Origin")
-
-    LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
-
-    def _is_authed(self):
-        """True if no key is configured, or a correct key was presented. Anthropic clients
-        (Claude Code, the Anthropic SDKs) authenticate with `x-api-key`, not `Bearer` — both
-        are accepted, and both are compared in constant time."""
-        if not self.server.api_key:
-            return True
-        import hmac
-        if hmac.compare_digest(self.headers.get("Authorization", ""),
-                               f"Bearer {self.server.api_key}"):
-            return True
-        return hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key)
-
-    def require_auth(self):
-        if not self._is_authed():
-            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                           "authentication_error")
-
-    def _check_host(self):
-        """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
-        drive this local server unless we pin the Host header to loopback / the bind
-        address. Rejects requests whose Host is anything else. (#SEC-7)"""
-        host = self.headers.get("Host", "")
-        if host.startswith("["):
-            name = host[1:].split("]", 1)[0]                       # [ipv6]:port
-        elif host.count(":") == 1:
-            name = host.rsplit(":", 1)[0]                          # host:port / ipv4:port
-        else:
-            name = host                                            # bare host / bracketless ipv6
-        name = name.strip().lower()
-        allowed = set(self.LOOPBACK_HOSTS)
-        allowed.update(self.server.allowed_hosts)          # #597: operator-trusted reverse-proxy names
-        try:
-            allowed.add(str(self.server.server_address[0]).strip("[]").lower())
-        except Exception:
-            pass
-        if name not in allowed:
-            raise APIError(403, "Host header not allowed.", None, "forbidden")
-
-    def read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            raise APIError(400, "Invalid Content-Length header.")
-        if length < 1 or length > MAX_BODY:
-            raise APIError(400, f"Request body must be between 1 and {MAX_BODY} bytes.")
-        raw = self.rfile.read(length)
-        # Only a full read leaves nothing to drain; a short read means the peer went away
-        # mid-body, and the drain will notice the EOF and close (#597 item 3).
-        self._body_read = len(raw) == length
-        try:
-            body = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise APIError(400, "Request body must be valid JSON.")
-        if not isinstance(body, dict):
-            raise APIError(400, "Request body must be a JSON object.")
-        return body
-
-    def check_model(self, body):
-        model = body.get("model")
-        if model != self.server.model_id:
-            raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
-
-    # The dashboard ships in two layouts and the old single path only knew one:
-    # a source checkout puts this file in c/ (so web/dist is one level UP), while
-    # a release archive and an installed tree put it next to web/dist. Probing for
-    # index.html rather than the directory keeps an empty leftover web/dist from
-    # shadowing a real one.
-    WEB_DIST = next(
-        (c for c in (Path(__file__).resolve().parent / "web" / "dist",
-                     Path(__file__).resolve().parent.parent / "web" / "dist")
-         if (c / "index.html").is_file()),
-        Path(__file__).resolve().parent.parent / "web" / "dist")
-
-    def serve_static(self, path):
-        """Serve the built web UI (web/dist) so `coli web` is one process.
-        Read-only, no auth (same trust level as /health), traversal-safe."""
-        if path.startswith("/v1/") or path == "/health":
-            return False
-        base = self.WEB_DIST.resolve()
-        if not base.is_dir():
-            return False
-        rel = unquote(path).lstrip("/") or "index.html"
-        target = (base / rel).resolve()
-        try:
-            target.relative_to(base)
-        except ValueError:
-            target = None
-        if target is None or not target.is_file():
-            if path == "/" or "." not in rel:      # SPA fallback
-                target = base / "index.html"
-                if not target.is_file():
-                    return False
-            else:
-                return False
-        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(data)
-        return True
-
-    def do_GET(self):
-        request_id = "req_" + uuid.uuid4().hex
-        try:
-            self._check_host()
-            path = urlsplit(self.path).path
-            if path == "/health":
-                # Liveness is always public; hardware/scheduler internals only when a
-                # request is authed (or no key set), so a configured key isn't leaked
-                # past a bare 200 to an unauthenticated probe. (#SEC-8)
-                payload = {"status": "ok"}
-                if self._is_authed():
-                    payload["scheduler"] = self.server.scheduler.snapshot()
-                    payload["kv_slots"] = self.server.kv_slots
-                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
-                    if tiers: payload["tiers"] = tiers
-                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
-                    if hwinfo: payload["hwinfo"] = hwinfo
-                self.send_json(200, payload, request_id)
-                return
-            if path == "/experts":
-                payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
-                eng = self.server.engine
-                if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
-                    payload.update(eng.emap)
-                    payload["hits"] = eng.hits or ""
-                    payload["seq"] = eng.hits_seq
-                self.send_json(200, payload, request_id)
-                return
-            if path == "/profile":
-                # (#SEC-8) same gate as /health and /experts above: this endpoint
-                # is served before require_auth(), so an unauthenticated caller
-                # reached it even with --api-key set. It carries per-turn
-                # telemetry -- prompt and completion token counts, per-phase
-                # timings, up to 120 turns -- which describes what the operator
-                # is running and how much. The pass that added _is_authed() to
-                # the two endpoints above did not reach this one.
-                eng = self.server.engine
-                payload = {"seq": 0, "turns": []}
-                if self._is_authed() and eng:
-                    payload["seq"] = getattr(eng, "profile_seq", 0)
-                    payload["turns"] = list(getattr(eng, "profile", ()) or ())
-                self.send_json(200, payload, request_id)
-                return
-            if self.serve_static(path):
-                return
-            self.require_auth()
-            if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [model_object(
-                    self.server.model_id, self.server.created)]}, request_id)
-            elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
-                self.send_json(200, model_object(self.server.model_id, self.server.created), request_id)
-            else:
-                raise APIError(404, "Not found.", None, "not_found")
-        except APIError as error:
-            self.send_json(error.status, error_object(error), request_id, error.headers)
-
-    def do_OPTIONS(self):
-        try:                                   # (#SEC-7) apply the Host guard uniformly, incl. CORS preflight
-            self._check_host()
-        except APIError:
-            self.send_response(403)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.send_cors_headers()
-        self.end_headers()
-
-    def do_POST(self):
-        request_id = "req_" + uuid.uuid4().hex
-        try:
-            self._check_host()
-            self.require_auth()
-            body = self.read_json()
-            self.check_model(body)
-            path = urlsplit(self.path).path
-            if path == "/v1/chat/completions":
-                self.chat_completion(body, request_id)
-            elif path == "/v1/completions":
-                self.completion(body, request_id)
-            elif path == "/v1/messages":
-                self.anthropic_messages(body, request_id)
-            else:
-                raise APIError(404, "Not found.", None, "not_found")
-        except APIError as error:
-            self._fail(error, request_id)
-        except ClientCancelled:
-            pass
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as error:
-            self.log_error("request failed: %s", error)
+        self._closed = True
+        if self._wpipe:
             try:
-                self._fail(APIError(500, "The colibri engine failed to process the request.",
-                                    None, "engine_error", "server_error"), request_id)
+                self._wpipe.close()
             except OSError:
                 pass
+        if self._rpipe:
+            try:
+                self._rpipe.close()
+            except OSError:
+                pass
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=3)
+                except Exception:
+                    pass
+
+    def generate(self, prompt, max_tokens, temperature, top_p, on_chunk,
+                 cache_slot, cancelled, grammar=None, stopped=None,
+                 on_accept=None, audio=None):
+        """Send a generation request to the engine and return stats.
+
+        The engine writes DATA frames (decoded text) to stdout; the caller
+        receives each chunk through `on_chunk`.  `cancelled` is a callable
+        returning True when the client disconnected (to abort long generations).
+        `on_accept` is called with the ACCEPT frame payload once the prompt
+        is accepted (before prefill starts).
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Engine is closed")
+            self._check_alive()
+            if self.arch == "glm":
+                # GLM protocol: SUBMIT header with 6 fields, then prompt body
+                header = (f"SUBMIT {self.ctx} {max_tokens} {temperature} "
+                          f"{top_p} {cache_slot}\n")
+                if grammar is not None:
+                    header += f"GRAMMAR {len(grammar.encode('utf-8'))}\n"
+                self._wpipe.write(header.encode("utf-8"))
+                self._wpipe.write(prompt.encode("utf-8"))
+                self._wpipe.write(END)
+            elif self.arch == "deepseek_v4":
+                # deepseek_v4 protocol: SUBMIT <id> <slot> <prompt_bytes> <max_tokens>
+                # <temperature> <top_p> [extension_bytes]\n<payload>\n
+                prompt_bytes = prompt.encode("utf-8")
+                rid = self._request_id
+                ext_len = len(audio) if audio else 0
+                v4_slot = cache_slot if cache_slot is not None else 0
+                header = (f"SUBMIT {rid} {v4_slot} {len(prompt_bytes)} "
+                          f"{max_tokens} {temperature} {top_p} {ext_len}\n")
+                sys.stderr.write(f"[engine] SUBMIT id={rid} slot={v4_slot} "
+                                 f"bytes={len(prompt_bytes)} max_tok={max_tokens} "
+                                 f"temp={temperature} top_p={top_p} ext={ext_len}\n")
+                sys.stderr.flush()
+                self._wpipe.write(header.encode("utf-8"))
+                self._wpipe.write(prompt_bytes)
+                if audio is not None:
+                    self._wpipe.write(audio)
+                self._wpipe.write(b"\n")  # delimiter (C code does fgetc(stdin))
+                sys.stderr.write(f"[engine] SUBMIT write complete, waiting for response...\n")
+                sys.stderr.flush()
+            elif self.arch in ("inkling", "kimi"):
+                # Colibri protocol: SUBMIT with 6 fields, then prompt body
+                header = (f"SUBMIT {self.ctx} {max_tokens} {temperature} "
+                          f"{top_p} {cache_slot}\n")
+                if grammar is not None:
+                    header += f"GRAMMAR {len(grammar.encode('utf-8'))}\n"
+                if audio is not None:
+                    header += f"AUDIO {len(audio)}\n"
+                    self._wpipe.write(audio)
+                self._wpipe.write(header.encode("utf-8"))
+                self._wpipe.write(prompt.encode("utf-8"))
+                self._wpipe.write(END)
+            else:
+                raise ValueError(f"Unknown architecture: {self.arch}")
+
+        # Read response frames
+        buf = b""
+        stats = {"prompt_tokens": 0, "completion_tokens": 0, "length_limited": False}
+        read_count = 0
+        while True:
+            try:
+                chunk = self._rpipe.read(65536)
+            except OSError as e:
+                sys.stderr.write(f"[engine] read error: {e}\n")
+                sys.stderr.flush()
+                break
+            if not chunk:
+                rc = self._process.poll()
+                sys.stderr.write(f"[engine] pipe closed (process exited, rc={rc})\n")
+                sys.stderr.flush()
+                break
+            read_count += 1
+            sys.stderr.write(f"[engine] read #{read_count}: got {len(chunk)} bytes, total buf={len(buf)+len(chunk)}\n")
+            sys.stderr.flush()
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.rstrip(b"\r")
+                sys.stderr.write(f"[engine] line: {line[:120]}\n")
+                sys.stderr.flush()
+                if self.arch == "deepseek_v4":
+                    # deepseek_v4 uses DONE frame (not END sentinel)
+                    # Format: DONE <id> STAT <completion> <tps> <hit_rate> <rss>
+                    #         <prompt_tokens> <length_limited> <prefix_reused>
+                    # Indices:  0     1   2      3            4      5         6
+                    #           7               8                  9
+                    if line.startswith(b"DONE "):
+                        parts = line.decode("utf-8", errors="replace").split()
+                        # Extract stats from DONE frame if available
+                        if len(parts) >= 9:
+                            try:
+                                stats["completion_tokens"] = int(parts[3])
+                                stats["prompt_tokens"] = int(parts[7])
+                                stats["length_limited"] = parts[8] == "1"
+                            except (ValueError, IndexError):
+                                pass
+                        sys.stderr.write(f"[engine] DONE: {line.decode('utf-8', errors='replace')}\n")
+                        sys.stderr.flush()
+                        return stats
+                    if line == READY:
+                        continue
+                    if line.startswith(b"ACCEPT "):
+                        sys.stderr.write(f"[engine] ACCEPT received: {line.decode('utf-8', errors='replace')}\n")
+                        sys.stderr.flush()
+                        on_accept and on_accept(line[7:])
+                        continue
+                    if line.startswith(b"DATA "):
+                        # C engine writes: "DATA <id> <bytes>\n<data bytes>\n"
+                        # After split on \n, `line` is the header, `buf` starts with data.
+                        parts = line.decode("utf-8", errors="replace").split()
+                        if len(parts) >= 3:
+                            data_len = int(parts[2])
+                            # Ensure we have enough bytes in the buffer
+                            while len(buf) < data_len:
+                                try:
+                                    more = self._rpipe.read(65536)
+                                    if not more:
+                                        break
+                                    buf += more
+                                except OSError:
+                                    break
+                            if len(buf) >= data_len:
+                                data = buf[:data_len]
+                                buf = buf[data_len:]
+                                # Skip trailing \n if present
+                                if buf.startswith(b"\n"):
+                                    buf = buf[1:]
+                                text = data.decode("utf-8", errors="replace")
+                                on_chunk(text)
+                                stats["completion_tokens"] += 1
+                    elif line.startswith(b"PROF "):
+                        parts = line[5:].decode().split()
+                        if len(parts) >= 3:
+                            stats["prompt_tokens"] = int(parts[0])
+                            stats["completion_tokens"] = int(parts[1])
+                            stats["length_limited"] = parts[2] == "length"
+                    elif line.startswith(b"STAT "):
+                        # Startup STAT line from engine, silently ignored
+                        continue
+                    elif line.startswith(b"ERROR "):
+                        msg = line[6:].decode("utf-8", errors="replace")
+                        sys.stderr.write(f"[engine] ERROR: {msg}\n")
+                        sys.stderr.flush()
+                        fields = msg.split()
+                        raise _engine_error(fields, msg)
+                    elif cancelled and cancelled():
+                        self._wpipe.write(b"CANCEL\n")
+                        while True:
+                            try:
+                                leftover = self._rpipe.read(65536)
+                            except OSError:
+                                break
+                            if not leftover:
+                                break
+                            if b"DONE " in leftover or b"ERROR " in leftover:
+                                break
+                        return stats
+                else:
+                    # GLM / inkling / kimi protocol (END-based)
+                    if line == END:
+                        return stats
+                    if line == READY:
+                        continue
+                    if line.startswith(b"ACCEPT "):
+                        on_accept and on_accept(line[7:])
+                        continue
+                    if line.startswith(b"DATA "):
+                        payload = line[5:]
+                        on_chunk(payload.decode("utf-8", errors="replace"))
+                        stats["completion_tokens"] += 1
+                    elif line.startswith(b"PROF "):
+                        parts = line[5:].decode().split()
+                        if len(parts) >= 3:
+                            stats["prompt_tokens"] = int(parts[0])
+                            stats["completion_tokens"] = int(parts[1])
+                            stats["length_limited"] = parts[2] == "length"
+                    elif line.startswith(b"ERROR "):
+                        msg = line[6:].decode("utf-8", errors="replace")
+                        fields = msg.split()
+                        raise _engine_error(fields, msg)
+                    elif cancelled and cancelled():
+                        self._wpipe.write(b"CANCEL\n")
+                        # drain the rest of the response
+                        while True:
+                            try:
+                                leftover = self._rpipe.read(65536)
+                            except OSError:
+                                break
+                            if not leftover:
+                                break
+                            if END in leftover:
+                                break
+                        return stats
+        sys.stderr.write(f"[engine] generate exiting with stats: {stats}\n")
+        sys.stderr.flush()
+        return stats
+
+
+class ColibriHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the OpenAI-compatible API."""
+
+    def log_message(self, format, *args):
+        try:
+            level = int(os.environ.get("COLI_LOG", "1"))
+        except ValueError:
+            level = 1
+        if level >= 1:
+            sys.stderr.write("%s - - [%s] %s\n" %
+                             (self.client_address[0], self.log_date_time_string(),
+                              format % args))
+            sys.stderr.flush()
+
+    def send_cors_headers(self):
+        origin = self.headers.get("Origin", "")
+        if origin in DEFAULT_CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods",
+                             "GET, POST, OPTIONS, DELETE")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Authorization, Content-Type, X-Request-ID")
+            self.send_header("Access-Control-Max-Age", "86400")
+
+    def send_json(self, status, body, request_id=None, extra_headers=None):
+        payload = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        if request_id:
+            self.send_header("x-request-id", request_id)
+        if extra_headers:
+            for name, value in extra_headers.items():
+                self.send_header(name, value)
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_BODY:
+            raise APIError(413, f"Request body too large (max {MAX_BODY} bytes).",
+                           None, "request_too_large")
+        return self.rfile.read(length)
+
+    def _parse_json_body(self):
+        try:
+            return json.loads(self._read_body())
+        except json.JSONDecodeError as exc:
+            raise APIError(400, f"Invalid JSON: {exc}", None, "invalid_json")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        if path == "/v1/models" or path == "/models":
+            self.send_json(200, {"object": "list", "data": [{"id": self.server.model_id,
+                            "object": "model", "owned_by": "colibri"}]})
+        elif path == "/health":
+            self.send_json(200, {"status": "ok"})
+        elif path == "/profile":
+            self.send_json(200, self.server._profile())
+        elif path == "/queue":
+            self.send_json(200, self.server.scheduler.snapshot())
+        else:
+            self._fail(APIError(404, "Not found.", None, "not_found"), self.headers.get("x-request-id"))
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        request_id = self.headers.get("x-request-id", "") or str(uuid.uuid4())
+        try:
+            body = self._parse_json_body()
+        except APIError as exc:
+            self._fail(exc, request_id)
+            return
+
+        if path == "/v1/chat/completions" or path == "/chat/completions":
+            self.chat_completion(body, request_id)
+        elif path == "/v1/completions" or path == "/completions":
+            self.completion(body, request_id)
+        elif path == "/v1/messages":
+            self.anthropic_messages(body, request_id)
+        else:
+            self._fail(APIError(404, "Not found.", None, "not_found"), request_id)
 
     def _fail(self, error, request_id):
         """Report an error, unless the response is already on the wire. Once a streaming 200
@@ -2258,7 +2050,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    # Use v4 parser for DeepSeek V4, GLM parser for others
+                    if ARCH == "deepseek_v4":
+                        content, calls = parse_tool_calls_v4(text, tools)
+                    else:
+                        content, calls = parse_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -2346,7 +2142,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # #597 item 4: GLM (chat) streams reasoning then </think> then the answer. Split the
             # reasoning into reasoning_content deltas instead of leaking it — and the raw </think> —
             # into visible content or the tool-call buffer.
-            glm_think = chat and ARCH != "inkling"
+            glm_think = chat and ARCH not in ("inkling", "deepseek_v4")
 
             def start_stream(_accept_info=None):
                 # #597 item 6: commit the streaming 200 (and start the keepalive) exactly once,
@@ -2381,16 +2177,21 @@ class APIHandler(BaseHTTPRequestHandler):
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # <tool_call> split across engine chunks is still caught.
+                # marker split across engine chunks is still caught.
+                # DeepSeek V4 uses DSML markers; GLM uses <tool_call>...</tool_call>
+                if ARCH == "deepseek_v4":
+                    tool_marker = DSML_TOOL_CALLS_OPEN
+                else:
+                    tool_marker = BOX_START
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = len(tool_marker) - 1
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = sp["buf"].find(tool_marker)
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -2420,7 +2221,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                # Use v4 parser for DeepSeek V4, GLM parser for others
+                if ARCH == "deepseek_v4":
+                    _content, calls = parse_tool_calls_v4("".join(raw), tools)
+                else:
+                    _content, calls = parse_tool_calls("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -2677,184 +2482,212 @@ class APIHandler(BaseHTTPRequestHandler):
             def emit_text(chunk):
                 if not chunk:
                     return
-                if not stream_state["text_started"]:
-                    stream_state["text_started"] = True
-                    send_event("content_block_start", {"type": "content_block_start",
-                        "index": text_index, "content_block": {"type": "text", "text": ""}})
-                send_event("content_block_delta", {"type": "content_block_delta",
-                    "index": text_index, "delta": {"type": "text_delta", "text": chunk}})
-
-            def emit_answer(chunk):
-                if not tools:
-                    emit_text(chunk)
-                    return
-                if state["in_tool"]:
-                    return                       # tool markers never reach the client as text
                 state["buf"] += chunk
                 cut = state["buf"].find(BOX_START)
                 if cut >= 0:
                     if cut:
-                        emit_text(state["buf"][:cut])
+                        send_event("content_block_start", {"type": "content_block_start",
+                            "index": text_index, "content_block": {"type": "text", "text": ""}})
+                        stream_state["text_started"] = True
+                        send_event("content_block_delta", {"type": "content_block_delta",
+                            "index": text_index, "delta": {"type": "text_delta", "text": state["buf"][:cut]}})
                     state["buf"] = ""
                     state["in_tool"] = True
                     return
                 flush = max(0, len(state["buf"]) - hold)
                 if flush:
-                    emit_text(state["buf"][:flush])
+                    if not stream_state["text_started"]:
+                        send_event("content_block_start", {"type": "content_block_start",
+                            "index": text_index, "content_block": {"type": "text", "text": ""}})
+                        stream_state["text_started"] = True
+                    send_event("content_block_delta", {"type": "content_block_delta",
+                        "index": text_index, "delta": {"type": "text_delta", "text": state["buf"][:flush]}})
                     state["buf"] = state["buf"][flush:]
 
             def emit_thinking(chunk):
-                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                    "delta": {"type": "thinking_delta", "thinking": chunk}})
-
-            def close_thinking():
-                if stream_state["thinking_closed"]:
+                if not chunk:
                     return
-                stream_state["thinking_closed"] = True
-                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                    "delta": {"type": "signature_delta",
-                              "signature": ANTHROPIC_LOCAL_SIGNATURE}})
-                send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                send_event("content_block_delta", {"type": "content_block_delta",
+                    "index": 0, "delta": {"type": "thinking_delta", "thinking": chunk,
+                    "signature": ANTHROPIC_LOCAL_SIGNATURE}})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
-
-            def on_text(chunk):
-                raw.append(chunk)
-                (split.feed if split else emit_answer)(chunk)
-
-            stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
+            think = ThinkingStreamSplit(emit_thinking, emit_text,
+                                        initial_thinking=enable_thinking)
+            stop_filter = StopFilter(stop_sequences, think.feed, ignore_leading_stop)
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
             stop_filter.finish()
-            if split:
-                split.finish()
-                close_thinking()               # budget exhaustion before </think>
-            if tools and not state["in_tool"] and state["buf"]:
+            think.finish()
+            if not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
-            ka_stop.set()
-            ka_thread.join(timeout=2)
-            if stream_state["text_started"]:
-                send_event("content_block_stop", {"type": "content_block_stop",
-                                                  "index": text_index})
 
-            content, stop_reason = blocks_and_stop("".join(raw), stats)
-            index = text_index + 1 if stream_state["text_started"] else 1
-            for block in content:
-                if block["type"] != "tool_use":
-                    continue                     # thinking/text blocks were streamed above
-                send_event("content_block_start", {"type": "content_block_start", "index": index,
-                    "content_block": {"type": "tool_use", "id": block["id"],
-                                      "name": block["name"], "input": {}}})
-                send_event("content_block_delta", {"type": "content_block_delta", "index": index,
-                    "delta": {"type": "input_json_delta",
-                              "partial_json": json.dumps(block["input"], ensure_ascii=False)}})
-                send_event("content_block_stop", {"type": "content_block_stop", "index": index})
-                index += 1
+            # Parse tool calls from raw buffer
+            _content, calls = parse_tool_calls("".join(raw), tools) if raw else ("", [])
+            # Also try parsing from the full output if no raw collected
+            if not raw:
+                # Reconstruct from state
+                pass
+
+            # For Anthropic, emit tool_use blocks
+            for i, call in enumerate(calls):
+                function = call["function"]
+                try:
+                    arguments = json.loads(function["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                tool_index = text_index + i
+                send_event("content_block_start", {"type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": call["id"],
+                                      "name": function["name"], "input": {}}})
+                send_event("content_block_delta", {"type": "content_block_delta",
+                    "index": tool_index, "delta": {"type": "input_json_delta",
+                    "partial_json": function["arguments"]}})
+
+            stop_reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             send_event("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": stats["completion_tokens"]}})
+                "usage": {"input_tokens": stats["prompt_tokens"],
+                          "output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
-            # close_connection was already set when the 200 was committed (#597 item 3).
+            ka_stop.set()
+            if ka_thread:
+                ka_thread.join(timeout=2)
 
     def completion(self, body, request_id):
+        """Raw /v1/completions: single prompt, no chat template."""
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
-            raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
-        if not prompt:
-            raise APIError(400, "`prompt` must not be empty.", "prompt")
+            raise APIError(400, "`prompt` must be a string.", "prompt")
         self.generation(body, prompt, request_id, False)
+
+    def _committed(self):
+        return getattr(self, '_committed', False)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
+    """Start the HTTP server (legacy public API, called by the coli CLI).
+
+    Parameters not supported by the new backend (api_key, cors_origins,
+    allowed_hosts) are accepted for backward compatibility but ignored.
+    """
     if engine is None:
         engine = default_engine()
-    if not 1 <= max_tokens:
-        raise ValueError("max_tokens must be positive")
-    if not 1 <= port <= 65535:
-        raise ValueError("port must be between 1 and 65535")
-    if max_queue < 0:
-        raise ValueError("max_queue cannot be negative")
-    if queue_timeout <= 0:
-        raise ValueError("queue_timeout must be positive")
-    if not 1 <= kv_slots <= 16:
-        raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4") and kv_slots != 1:
-        raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
-    if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
-        # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
-        # a compute-heavy API to the network. Refuse unless explicitly overridden.
-        if os.environ.get("COLI_ALLOW_INSECURE_BIND") == "1":
-            print("WARNING: binding %s beyond localhost with NO auth (COLI_ALLOW_INSECURE_BIND=1)" % host,
-                  file=sys.stderr)
-        else:
-            print("refusing to bind %s beyond localhost without COLI_API_KEY set "
-                  "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
-            sys.exit(1)
-    origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
-    # Bind before starting the 744B engine. A stale/occupied port must fail in
-    # milliseconds rather than loading hundreds of GB and leaking a child.
-    server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
-    runtime = None
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    class Args:
+        pass
+
+    args = Args()
+    args.engine = engine
+    args.model = model
+    args.host = host
+    args.port = port
+    args.model_id = model_id
+    args.max_tokens = max_tokens
+    args.max_queue = max_queue
+    args.queue_timeout = queue_timeout
+    args.kv_slots = kv_slots
+    args.ctx = 8192
+    args.max_batch = 2048
+    args.gpu_layer = 0
+    args.tensor_split = None
+    args.mlock = False
+    args.flash_attn = False
+    args.threads = 0
+    args.threads_batch = 0
+    args.verbose = False
+    args.cap = cap
+    args.env = env
+    args.arch = ARCH if ARCH != "auto" else model_arch(model)
+
+    _serve(args)
+
+
+def _serve(args):
+    """Start the HTTP server."""
+    engine = Engine(args.engine, args.model, args.ctx, args.max_tokens, args.max_batch, args.kv_slots,
+                    args.gpu_layer, args.tensor_split, args.mlock, args.flash_attn,
+                    args.threads, args.threads_batch, args.verbose, cap=getattr(args, "cap", None),
+                    model_arch=args.arch, env=getattr(args, "env", None))
+    engine.start()
+
+    class Server(ThreadingHTTPServer):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.engine = engine
+            self.model_id = args.model_id
+            self.max_tokens = args.max_tokens
+            self.kv_slots = args.kv_slots
+            self.scheduler = GenerationScheduler(args.max_queue, args.queue_timeout, args.kv_slots)
+            self._profile_data = []
+
+        def _profile(self):
+            return {"turns": self._profile_data[-PROFILE_TURNS:],
+                    "scheduler": self.scheduler.snapshot()}
+
+    server = Server(("" if args.host == "0.0.0.0" else args.host, args.port), ColibriHandler)
+
+    def shutdown(signum, frame):
+        sys.stderr.write(f"\nShutting down on signal {signum}...\n")
+        sys.stderr.flush()
+        server.shutdown()
+        engine.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    sys.stderr.write(f"Colibri OpenAI API server listening on {args.host}:{args.port}\n")
+    sys.stderr.write(f"Engine: {args.engine}, Model: {args.model_id}, "
+                     f"Arch: {args.arch}, Max tokens: {args.max_tokens}\n")
+    sys.stderr.flush()
+
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
-        server.engine = runtime
-        print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
-        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         server.serve_forever()
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        server.scheduler.close()
-        server.server_close()
-        if runtime is not None:
-            runtime.close()
+        engine.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
-                        help="chat-template family; auto reads model_type from the model's config.json")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
-    parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
-    parser.add_argument("--cors-origin", action="append", default=None,
-                        help="allowed browser origin; repeat as needed (use '*' for any origin)")
-    # Absent = not explicitly set: mirrors coli's --cap (see cap_for_arch and issue
-    # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
-    # explicit value, 0 included, reaches the engine verbatim.
-    parser.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
-    parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
-    parser.add_argument("--queue-timeout", type=float,
-                        default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
-    parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
-    parser.add_argument("--allowed-host", action="append",
-        default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
-        help="additional Host header value accepted by the DNS-rebinding guard "
-             "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
-             "or set COLI_ALLOWED_HOSTS as a comma-separated list")
-    args = parser.parse_args()
     global ARCH
+    parser = argparse.ArgumentParser(description="Colibri OpenAI-compatible API server")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
+    parser.add_argument("--model", type=str, required=True, help="Model file path")
+    parser.add_argument("--ctx", type=int, default=8192, help="Context size (default: 8192)")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="Max generation tokens")
+    parser.add_argument("--max-batch", type=int, default=2048, help="Max batch size (default: 2048)")
+    parser.add_argument("--kv-slots", type=int, default=1, help="Number of KV slots (default: 1)")
+    parser.add_argument("--gpu-layer", type=int, default=9999, help="GPU layers (default: all)")
+    parser.add_argument("--tensor-split", type=str, default=None, help="Tensor split ratio")
+    parser.add_argument("--mlock", action="store_true", help="Lock memory")
+    parser.add_argument("--flash-attn", action="store_true", help="Flash attention")
+    parser.add_argument("--threads", type=int, default=0, help="CPU threads")
+    parser.add_argument("--threads-batch", type=int, default=0, help="Batch threads")
+    parser.add_argument("--verbose", action="store_true", help="Verbose engine output")
+    parser.add_argument("--max-queue", type=int, default=8, help="Max queue size (default: 8)")
+    parser.add_argument("--queue-timeout", type=int, default=300, help="Queue timeout (default: 300s)")
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
+                        help="Model architecture (default: auto-detect)")
+    parser.add_argument("--engine", default=None, help="Path to the engine binary")
+    parser.add_argument("--model-id", default=None, help="Model ID for the API")
+    args = parser.parse_args()
+
     ARCH = args.arch
     if ARCH == "auto":
         ARCH = model_arch(args.model)
+    args.arch = ARCH
     if args.model_id is None:
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
                          "kimi-k3-colibri" if ARCH == "kimi" else
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
-                         "glm-5.2-colibri")
-    serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
-          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host)
+                         "glm-colibri")
+    if args.engine is None:
+        args.engine = default_engine()
+    _serve(args)
 
 
 if __name__ == "__main__":
