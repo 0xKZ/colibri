@@ -1,6 +1,4 @@
-# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux and Windows/MSYS2 only.
-# Uses GNU ld -Wl,--wrap and gcc -march; do not invoke from macOS/PowerPC
-# `make check` (the parent Makefile gates COLI_V4_SUPPORTED).
+# DeepSeek V4 amalgamation build — x86-64/aarch64 Linux, macOS, and Windows/MSYS2.
 
 ifeq ($(OS),Windows_NT)
 IS_WIN := 1
@@ -19,10 +17,14 @@ else ifeq ($(UNAME_S),Linux)
 ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
 COLI_V4_OK := 1
 endif
+else ifeq ($(UNAME_S),Darwin)
+ifneq (,$(filter x86_64 amd64 aarch64 arm64,$(UNAME_M)))
+COLI_V4_OK := 1
+endif
 endif
 
 ifneq ($(COLI_V4_OK),1)
-$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux and Windows/MSYS2)
+$(error Makefile.deepseek-v4 supports only x86-64/aarch64 Linux, macOS, and Windows/MSYS2)
 endif
 
 ifneq ($(IS_WIN),)
