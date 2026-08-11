@@ -147,8 +147,11 @@ jobs:
           - os: macos-latest
             name: macos
             shell: bash
-            # No v4: the engine builds on x86-64 Linux/Windows and aarch64 Linux
-            # only (COLI_V4_SUPPORTED in c/Makefile); the target exits 1 here.
+            # arm64 macOS joined COLI_V4_SUPPORTED: compat.h carries the
+            # platform differences (fadvise/F_RDADVISE, O_DIRECT/F_NOCACHE)
+            # and the token-exact tiny oracle below is the acceptance gate.
+            v4: "1"
+
           - os: windows-latest
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
@@ -190,6 +193,15 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+      # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
+      # engine coverage lives solely in this job (Linux has the v4-tiny job in
+      # check.yml, Windows was first exercised at the release tag). The tiny
+      # oracle is the token-exactness gate: it fails on any numerical or I/O
+      # divergence, which is exactly what a platform port can break.
+      - name: DeepSeek V4 tiny oracle (macOS)
+        if: matrix.os == 'macos-latest'
+        run: make -C c deepseek-v4-tiny-check
 
       # The Windows backend-DLL loader contract (c/tests/test_backend_loader.py)
       # had no CI anywhere: the `python` job below is Linux-only, where these

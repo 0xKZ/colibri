@@ -668,12 +668,30 @@ static int multiply_u64(uint64_t a, uint64_t b, uint64_t *output) {
     return 0;
 }
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 uint64_t coli_v4_os_available_memory(void) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
     memset(&status, 0, sizeof(status));
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
+#elif defined(__APPLE__)
+    /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
+     * kernel could hand out without swapping: free + inactive pages -- the
+     * same approximation Activity Monitor reports, and the closest analogue
+     * of Linux's MemAvailable (which also counts reclaimable cache). */
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm;
+    vm_size_t page = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS &&
+        host_page_size(mach_host_self(), &page) == KERN_SUCCESS && page)
+        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) *
+               (uint64_t)page;
+    return 0;
 #else
     FILE *stream = fopen("/proc/meminfo", "r");
     if (stream) {
